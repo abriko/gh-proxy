@@ -4,14 +4,14 @@
  * static files (404.html, sw.js, conf.js)
  */
 const ASSET_URL = 'https://hunshcn.github.io/gh-proxy/'
-// 前缀，如果自定义路由为example.com/gh/*，将PREFIX改为 '/gh/'，注意，少一个杠都会错！
+// Prefix, if custom routing is example.com/gh/*, change PREFIX to '/gh/', note that omitting one slash will cause an error!
 const PREFIX = '/'
-// 分支文件使用jsDelivr镜像的开关，0为关闭，默认关闭
+// Switch for using jsDelivr mirror for branch files, 0 for off, default off
 const Config = {
     jsdelivr: 0
 }
 
-const whiteList = [] // 白名单，路径里面有包含字符的才会通过，e.g. ['/username/']
+const whiteList = [] // White list, paths containing characters will pass, e.g. ['/username/']
 
 /** @type {ResponseInit} */
 const PREFLIGHT_INIT = {
@@ -54,13 +54,6 @@ function newUrl(urlStr) {
 }
 
 
-addEventListener('fetch', e => {
-    const ret = fetchHandler(e)
-        .catch(err => makeRes('cfworker error:\n' + err.stack, 502))
-    e.respondWith(ret)
-})
-
-
 function checkUrl(u) {
     for (let i of [exp1, exp2, exp3, exp4, exp5, exp6]) {
         if (u.search(i) === 0) {
@@ -71,42 +64,11 @@ function checkUrl(u) {
 }
 
 /**
- * @param {FetchEvent} e
- */
-async function fetchHandler(e) {
-    const req = e.request
-    const urlStr = req.url
-    const urlObj = new URL(urlStr)
-    let path = urlObj.searchParams.get('q')
-    if (path) {
-        return Response.redirect('https://' + urlObj.host + PREFIX + path, 301)
-    }
-    // cfworker 会把路径中的 `//` 合并成 `/`
-    path = urlObj.href.substr(urlObj.origin.length + PREFIX.length).replace(/^https?:\/+/, 'https://')
-    if (path.search(exp1) === 0 || path.search(exp5) === 0 || path.search(exp6) === 0 || path.search(exp3) === 0 || path.search(exp4) === 0) {
-        return httpHandler(req, path)
-    } else if (path.search(exp2) === 0) {
-        if (Config.jsdelivr) {
-            const newUrl = path.replace('/blob/', '@').replace(/^(?:https?:\/\/)?github\.com/, 'https://cdn.jsdelivr.net/gh')
-            return Response.redirect(newUrl, 302)
-        } else {
-            path = path.replace('/blob/', '/raw/')
-            return httpHandler(req, path)
-        }
-    } else if (path.search(exp4) === 0) {
-        const newUrl = path.replace(/(?<=com\/.+?\/.+?)\/(.+?\/)/, '@$1').replace(/^(?:https?:\/\/)?raw\.(?:githubusercontent|github)\.com/, 'https://cdn.jsdelivr.net/gh')
-        return Response.redirect(newUrl, 302)
-    } else {
-        return fetch(ASSET_URL + path)
-    }
-}
-
-
-/**
  * @param {Request} req
  * @param {string} pathname
+ * @param {Object} env - Cloudflare environment variables
  */
-function httpHandler(req, pathname) {
+async function httpHandler(req, pathname, env) {
     const reqHdrRaw = req.headers
 
     // preflight
@@ -141,7 +103,7 @@ function httpHandler(req, pathname) {
         redirect: 'manual',
         body: req.body
     }
-    return proxy(urlObj, reqInit)
+    return proxy(urlObj, reqInit, env)
 }
 
 
@@ -149,13 +111,49 @@ function httpHandler(req, pathname) {
  *
  * @param {URL} urlObj
  * @param {RequestInit} reqInit
+ * @param {Object} env - Cloudflare environment variables
  */
-async function proxy(urlObj, reqInit) {
+async function proxy(urlObj, reqInit, env) {
+    const path = urlObj.href
+    
+    // Check if URL matches any private repository scope
+    const privateTokens = env.PRIVATE_TOKENS ? 
+        (typeof env.PRIVATE_TOKENS === 'string' ? JSON.parse(env.PRIVATE_TOKENS) : env.PRIVATE_TOKENS) : {}
+    
+    for (const scope in privateTokens) {
+        if (path.includes(`/${scope}/`)) {
+            // Add GitHub authentication token
+            reqInit.headers.set('Authorization', `token ${privateTokens[scope]}`)
+            break
+        }
+    }
+
     const res = await fetch(urlObj.href, reqInit)
     const resHdrOld = res.headers
     const resHdrNew = new Headers(resHdrOld)
 
     const status = res.status
+
+    // Handle 403 response, could be a private repository
+    if (status === 403) {
+        const body = await res.text()
+        if (body.includes('Not Found') || body.includes('rate limit')) {
+            // Could be a private repository or API rate limit
+            const isRateLimit = body.includes('rate limit')
+            const message = isRateLimit 
+                ? 'Request is limited by GitHub API rate limit. Please try again later.'
+                : 'Access denied. This could be a private repository that requires authentication. Please check repository permissions and token configuration.'
+            
+            return new Response(message, {
+                status: 403,
+                headers: {
+                    'content-type': 'text/html; charset=utf-8',
+                    'access-control-allow-origin': '*'
+                }
+            })
+        }
+        return new Response(res.body, { status, headers: resHdrNew })
+    }
 
     if (resHdrNew.has('location')) {
         let _location = resHdrNew.get('location')
@@ -163,7 +161,7 @@ async function proxy(urlObj, reqInit) {
             resHdrNew.set('location', PREFIX + _location)
         else {
             reqInit.redirect = 'follow'
-            return proxy(newUrl(_location), reqInit)
+            return proxy(newUrl(_location), reqInit, env)
         }
     }
     resHdrNew.set('access-control-expose-headers', '*')
@@ -177,5 +175,44 @@ async function proxy(urlObj, reqInit) {
         status,
         headers: resHdrNew,
     })
+}
+
+/**
+ * @param {Request} req
+ * @param {Object} env - Cloudflare environment variables
+ */
+async function fetchHandler(req, env) {
+    const urlStr = req.url
+    const urlObj = new URL(urlStr)
+    let path = urlObj.searchParams.get('q')
+    if (path) {
+        return Response.redirect('https://' + urlObj.host + PREFIX + path, 301)
+    }
+    // cfworker 会把路径中的 `//` 合并成 `/`
+    path = urlObj.href.substr(urlObj.origin.length + PREFIX.length).replace(/^https?:\/+/, 'https://')
+    if (path.search(exp1) === 0 || path.search(exp5) === 0 || path.search(exp6) === 0 || path.search(exp3) === 0 || path.search(exp4) === 0) {
+        return httpHandler(req, path, env)
+    } else if (path.search(exp2) === 0) {
+        if (Config.jsdelivr) {
+            const newUrl = path.replace('/blob/', '@').replace(/^(?:https?:\/\/)?github\.com/, 'https://cdn.jsdelivr.net/gh')
+            return Response.redirect(newUrl, 302)
+        } else {
+            path = path.replace('/blob/', '/raw/')
+            return httpHandler(req, path, env)
+        }
+    } else if (path.search(exp4) === 0) {
+        const newUrl = path.replace(/(?<=com\/.+?\/.+?)\/(.+?\/)/, '@$1').replace(/^(?:https?:\/\/)?raw\.(?:githubusercontent|github)\.com/, 'https://cdn.jsdelivr.net/gh')
+        return Response.redirect(newUrl, 302)
+    } else {
+        return fetch(ASSET_URL + path)
+    }
+}
+
+// Main export for Cloudflare Workers
+export default {
+    async fetch(request, env, ctx) {
+        return fetchHandler(request, env)
+            .catch(err => makeRes('cfworker error:\n' + err.stack, 502))
+    }
 }
 
